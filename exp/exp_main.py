@@ -8,8 +8,7 @@ from exp.exp_basic import Exp_Basic
 from models import Informer, Autoformer, Transformer, Reformer
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
-from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter(log_dir="./logs")
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -140,8 +139,7 @@ class Exp_Main(Exp_Basic):
                 loss = criterion(outputs, batch_y)
                 train_loss.append(loss.item())
 
-                if (i + 1) % 5 == 0:
-                    
+                if (i + 1) % 1 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
@@ -161,10 +159,6 @@ class Exp_Main(Exp_Basic):
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
-
-            writer.add_scalar("Loss/Train", train_loss, epoch)
-            writer.add_scalar("Loss/Validation", vali_loss, epoch)
-            writer.add_scalar("Loss/Test", test_loss, epoch)
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
@@ -237,13 +231,6 @@ class Exp_Main(Exp_Basic):
         f.write('\n')
         f.write('\n')
         f.close()
-
-        writer.add_scalar("Test/MSE", mse)
-        writer.add_scalar("Test/MAE", mae)
-        writer.add_scalar("Test/RMSE", rmse)
-        writer.add_scalar("Test/MAPE", mape)
-        writer.add_scalar("Test/MSPE", mspe)
-
 
         np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
         np.save(folder_path + 'pred.npy', preds)
