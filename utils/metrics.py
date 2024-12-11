@@ -1,5 +1,7 @@
 import numpy as np
-
+import torch
+from torcheval.metrics.functional import r2_score
+from torcheval.metrics import R2Score
 
 def RSE(pred, true):
     return np.sqrt(np.sum((true - pred) ** 2)) / np.sqrt(np.sum((true - true.mean()) ** 2))
@@ -30,10 +32,13 @@ def MAPE(pred, true, epsilon=1e-8):
 def MSPE(pred, true, epsilon=1e-8):
     return np.mean(np.square((pred - true) / (true + epsilon)))
 
+
 def R2(pred, true):
-    ss_res = np.sum((true - pred) ** 2)
-    ss_tot = np.sum((true - true.mean()) ** 2)
-    return 1 - (ss_res / (ss_tot + 1e-8))
+    target_mean = np.mean(true)
+    ss_tot = np.sum((pred - target_mean) ** 2)
+    ss_res = np.sum((pred - true) ** 2)
+    r2 = 1 - ss_res / ss_tot
+    return r2
 
 def metric(pred, true):
     mae = MAE(pred, true)
