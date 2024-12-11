@@ -1,14 +1,19 @@
 import logging
-logging.basicConfig(format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+logging.basicConfig(
+    filename="./log_experiment.log",
+    filemode='a',
+    format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
     datefmt='%Y-%m-%d:%H:%M:%S',
-    level=logging.INFO)
+    level=logging.DEBUG)
+from torch.utils.tensorboard import SummaryWriter  # Import TensorBoard's SummaryWriter
+
 
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
-from models import Informer, Autoformer, Transformer, Reformer
+from models import PatchMixer
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
-
+import datetime
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,13 +31,11 @@ warnings.filterwarnings('ignore')
 class Exp_Main(Exp_Basic):
     def __init__(self, args):
         super(Exp_Main, self).__init__(args)
+        self.writer = SummaryWriter(log_dir="./tensorboard_logs")
 
     def _build_model(self):
         model_dict = {
-            'Autoformer': Autoformer,
-            'Transformer': Transformer,
-            'Informer': Informer,
-            'Reformer': Reformer,
+            'PatchMixer': PatchMixer
         }
         model = model_dict[self.args.model].Model(self.args).float()
 
@@ -59,7 +62,7 @@ class Exp_Main(Exp_Basic):
         # encoder - decoder
 
         def _run_model():
-            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            outputs = self.model(batch_x)
             if self.args.output_attention:
                 outputs = outputs[0]
             return outputs
@@ -95,6 +98,9 @@ class Exp_Main(Exp_Basic):
                 loss = criterion(pred, true)
 
                 total_loss.append(loss)
+                
+                if (i + 1) % 25 == 0:
+                    logging.info("\titers: {0},loss: {1:.7f}".format(i + 1, loss.item()))
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
@@ -108,9 +114,16 @@ class Exp_Main(Exp_Basic):
         if not os.path.exists(path):
             os.makedirs(path)
 
-        time_now = time.time()
+        best_model_path = path + '/' + 'checkpoint.pth'
+        if self.args.recover:
+            if os.path.exists(best_model_path):  # Load if recovering from training
+                self.model.load_state_dict(torch.load(best_model_path))
 
-        train_steps = len(train_loader)
+        time_now = time.time()
+        start_time = time_now  # Track the start time
+        max_time_reached = False
+
+        train_steps = min(len(train_loader), self.args.max_num_batches_per_epoch)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         model_optim = self._select_optimizer()
@@ -139,45 +152,58 @@ class Exp_Main(Exp_Basic):
                 loss = criterion(outputs, batch_y)
                 train_loss.append(loss.item())
 
-                if (i + 1) % 1 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                if (i + 1) % 25 == 0:
+                    self.writer.add_scalar('Training Loss', loss.item(), epoch * len(train_loader) + i)
+                    logging.info("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                    logging.info('\tspeed: {:.4f}s/iter; left time: {:.4f}s - {}'.format(speed, left_time, (datetime.datetime.now()+datetime.timedelta(seconds=left_time)).strftime('%Y-%m-%d %H:%M:%S')))
+                    logging.info(f"Time to finish epoch {speed * len(train_loader) - i}s - {(speed * len(train_loader) - i)/3600}h")
                     iter_count = 0
                     time_now = time.time()
+                    if time.time() - start_time >= self.args.max_training_time:
+                        torch.save(self.model.state_dict(), os.path.join(path, 'checkpoint.pth'))
+                        logging.info("Time limit reached. Saving checkpoint and exiting.")
+                        max_time_reached = True
 
-                if self.args.use_amp:
-                    scaler.scale(loss).backward()
-                    scaler.step(model_optim)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    model_optim.step()
+                loss.backward()
+                model_optim.step()
 
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+                if i >= self.args.max_num_batches_per_epoch:
+                    logging.info(f"Reached max batches for epoch {epoch}: {self.args.max_num_batches_per_epoch}")
+                    break
+
+                if max_time_reached:
+                    break
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
+            self.writer.add_scalar('Epoch Training Loss', train_loss, epoch)
+            self.writer.add_scalar('Validation Loss', vali_loss, epoch)
+            self.writer.add_scalar('Test Loss', test_loss, epoch)
+            logging.info("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+
+            logging.info("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
-                print("Early stopping")
+                logging.info("Early stopping")
                 break
 
             adjust_learning_rate(model_optim, epoch + 1, self.args)
 
-        best_model_path = path + '/' + 'checkpoint.pth'
-        self.model.load_state_dict(torch.load(best_model_path))
+            if max_time_reached:
+                break
 
+        self.model.load_state_dict(torch.load(best_model_path))
+        self.writer.close()
         return
 
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
         if test:
-            print('loading model')
+            logging.info('loading model')
             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
 
         preds = []
@@ -205,18 +231,13 @@ class Exp_Main(Exp_Basic):
 
                 preds.append(pred)
                 trues.append(true)
-                if i % 20 == 0:
-                    input = batch_x.detach().cpu().numpy()
-                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
-                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
-                    visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
 
         preds = np.concatenate(preds, axis=0)
         trues = np.concatenate(trues, axis=0)
-        print('test shape:', preds.shape, trues.shape)
+        logging.info(f'test shape: {preds.shape}, {trues.shape}')
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
         trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-        print('test shape:', preds.shape, trues.shape)
+        logging.info(f'test shape: {preds.shape}, {trues.shape}')
 
         # result save
         folder_path = './results/' + setting + '/'
@@ -224,10 +245,10 @@ class Exp_Main(Exp_Basic):
             os.makedirs(folder_path)
 
         mae, mse, rmse, mape, mspe, r2 = metric(preds, trues)
-        print('mse:{}, mae:{}'.format(mse, mae))
+        logging.info('mse:{}, mae:{}, rmse:{}, mae:{}, mape:{}, r2:{}'.format(mae, mse, rmse, mape, mspe, r2))
         f = open("result.txt", 'a')
         f.write(setting + "  \n")
-        f.write('mse:{}, mae:{}, R^2: {}'.format(mse, mae, r2))
+        f.write('mse:{}, mae:{}, rmse:{}, mape:{}, mspe:{}, r2:{}'.format(mae, mse, rmse, mape, mspe, r2))
         f.write('\n')
         f.write('\n')
         f.close()
@@ -239,6 +260,7 @@ class Exp_Main(Exp_Basic):
         return
 
     def predict(self, setting, load=False):
+        logging.info("Going to predict")
         pred_data, pred_loader = self._get_data(flag='pred')
 
         if load:

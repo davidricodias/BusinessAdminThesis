@@ -1,6 +1,12 @@
 import os
 import torch
-
+import logging
+logging.basicConfig(
+    filename="./log_experiment.log",
+    filemode='a',
+    format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+    datefmt='%Y-%m-%d:%H:%M:%S',
+    level=logging.DEBUG)
 
 class Exp_Basic(object):
     def __init__(self, args):
@@ -17,10 +23,10 @@ class Exp_Basic(object):
             os.environ["CUDA_VISIBLE_DEVICES"] = str(
                 self.args.gpu) if not self.args.use_multi_gpu else self.args.devices
             device = torch.device('cuda:{}'.format(self.args.gpu))
-            print('Use GPU: cuda:{}'.format(self.args.gpu))
+            logging.info('Use GPU: cuda:{}'.format(self.args.gpu))
         else:
             device = torch.device('cpu')
-            print('Use CPU')
+            logging.info('Use CPU')
         return device
 
     def _get_data(self):
