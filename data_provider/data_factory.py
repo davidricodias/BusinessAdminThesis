@@ -1,11 +1,11 @@
 import os
-from data_provider.data_loader import Dataset_Custom
+import random
+from data_provider.data_loader import Dataset_Custom, Dataset_Pred
 from torch.utils.data import DataLoader, ConcatDataset
 
 data_dict = {
-    'custom': Dataset_Custom,
+    'custom': Dataset_Custom
 }
-
 
 def data_provider(args, flag):
     Data = data_dict[args.data]
@@ -21,29 +21,25 @@ def data_provider(args, flag):
         drop_last = False
         batch_size = 1
         freq = args.freq
-        Data = Dataset_Custom
+        Data = Dataset_Pred
     else:
         shuffle_flag = True
         drop_last = True
         batch_size = args.batch_size
         freq = args.freq
 
-    datasets = []
-    for data_path in os.listdir(args.root_path):
-        data_set = Data(
-            root_path=args.root_path,
-            data_path=data_path,
-            flag=flag,
-            size=[args.seq_len, args.label_len, args.pred_len],
-            features=args.features,
-            target=args.target,
-            timeenc=timeenc,
-            freq=freq
-        )
-        datasets.append(data_set)
-    concat_dataset = ConcatDataset(datasets)
+    data_set = Data(
+        root_path=args.root_path,
+        data_path=args.data_path,
+        flag=flag,
+        size=[args.seq_len, args.label_len, args.pred_len],
+        features=args.features,
+        target=args.target,
+        timeenc=timeenc,
+        freq=freq
+    )
     data_loader = DataLoader(
-        concat_dataset,
+        data_set,
         batch_size=batch_size,
         shuffle=shuffle_flag,
         num_workers=args.num_workers,
