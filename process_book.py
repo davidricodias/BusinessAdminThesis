@@ -1,33 +1,21 @@
-# %%
+
 import os
 import logging
-import threading
+import argparse
+import random
+import torch
 import polars as pl
 import numpy as np
+import polars_xdt  # noqa: F401
 from datetime import time
-pl.Config.set_tbl_cols(100)
 
-# %%
-# Logging configuration
-outfile = "./log"
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(outfile),
-        logging.StreamHandler()
-    ]
-)
 
-logging.info(f"Starting {os.path.abspath(__file__)}")
-
-# %%
 # Data configuration
 root = os.path.abspath(os.path.abspath(''))
 raw_data_folder = os.path.join(root, "raw_data")
 final_data_folder = os.path.join(root, "dataset", "lob")
 book_filename = os.path.join(raw_data_folder, "book.csv.gz")
-
+trades_filename = os.path.join(raw_data_folder, "trades.csv.gz")
 
 bid_columns_to_check_all_nans = [
     'L2-BidPrice',  'L2-BidSize',  'L2-BuyNo',
@@ -82,94 +70,141 @@ ordered_columns = [
     "L1-SellNo", "L2-SellNo", "L3-SellNo", "L4-SellNo", "L5-SellNo", "L6-SellNo", "L7-SellNo", "L8-SellNo", "L9-SellNo", "L10-SellNo"
 ]
 
+trades_drop_columns = ["Trade Price Currency", "Ex/Cntrb.ID", "Seq. No.", "Domain", "Qualifiers", "Type", "Exch Time"]
 
-# %%
-def __write_csv(df: pl.DataFrame, ric, date):
-    logging.info(f"Going to save csv for {ric} on {date}")
-    filename = os.path.join(final_data_folder, f"{ric}_{date.strftime('%y_%m_%d')}.csv")
-    df.filter((pl.col("#RIC") == ric) & (pl.col("Date") == date)).drop(["#RIC", "Date"]).rename({"Date-Time": "date"}).write_csv(filename)
-
-# %%
-book_df = pl.scan_csv(book_filename, infer_schema_length=100000, try_parse_dates=True)
-logging.info(f"Going to lazy load {book_filename}")
-# %%
-
-nanoseconds_in_a_microsecond = 1000
-book_df = (
-    book_df
-    .drop(["Domain", "GMT Offset", "Type", "Exch Time"])
-    .filter(
-        (pl.col("Date-Time").dt.time() >= time(7, 0)) &
-        (pl.col("Date-Time").dt.time() <= time(15, 30))
-    )
-    .filter(~pl.all_horizontal(pl.col(bid_columns_to_check_all_nans).is_null()))
-    .filter(~pl.all_horizontal(pl.col(ask_columns_to_check_all_nans).is_null()))
-    .with_columns(
-        [pl.col(col).fill_null(0) for col in fill_null_with_zero]
-    )  # Fill null size and number of orders with zero 
-    .with_columns(
-        [pl.col(col).fill_null(strategy='forward') for col in [*bid_price_columns, *ask_price_columns]]
-    )  # Fill 
-    .with_columns(
-        pl.col("Date-Time").dt.date().alias("Date")
-    )
-    .with_columns(pl.col("Date-Time").dt.round("500ms").alias("Date-Time"))
-    .drop_nulls()
-    # .with_columns(
-    #     pl.len().over("Date-Time").alias('duplicate_datetime')
-    # )
-    # .with_columns(
-    #     pl.col("Date-Time").cum_count().over("Date-Time").alias('counter')
-    # )
-    # .with_columns(
-    #     (pl.col("Date-Time").dt.cast_time_unit('ns') + pl.duration(nanoseconds=(nanoseconds_in_a_microsecond/pl.col("duplicate_datetime"))*(pl.col("counter")-1))).alias("Date-Time")
-    # )
-    .select(ordered_columns)
-).collect()
-from datetime import timedelta
-
-# This snippet checks for the minimum time between events. 
-# For the 3 symbols is 1 microsecond (AENA)
-min_time_diff = 10e8
-for ric in book_df.select(["#RIC"]).unique().to_numpy():
-    df_with_diffs = book_df.filter(
-        pl.col("#RIC") == ric
-    ).with_columns([
-        (pl.col("Date-Time") - pl.col("Date-Time").shift(1)).alias("time_diff")
-    ]).with_columns(
-        pl.col("time_diff").cast(pl.Int64).alias("time_diff")
-    )
-    min_diff_ric = df_with_diffs.select(pl.col("time_diff").min()).item()
-    if min_diff_ric < min_time_diff:
-        min_time_diff = min_diff_ric
-    logging.info(f"The minimal time diff for {ric} is {min_diff_ric}")
-logging.info(f"The minimal time diff for all symbols is {min_time_diff}, {type(min_time_diff)}")
-
-# Upsample then downsample to have equally-spaced measures
-import pandas as pd
-new_book_df = pl.DataFrame()
-for (ric, date) in book_df.select(["#RIC", "Date"]).unique().to_numpy():
+def write_book_one_day(book_df, trades_df, ric, date):
     logging.info(f"Going to save csv for {ric} on {date}")
     df = book_df.filter(
-        (pl.col("#RIC") == ric) & (pl.col("Date") == date)
+            (pl.col("#RIC") == ric) & (pl.col("Date") == date)
+        )
+        
+    first_row = df.head(1).with_columns(
+            (pl.col("Date-Time").dt.truncate("1s")).alias("Date-Time")
+        )
+    df = pl.concat([first_row, df])
+            
+
+    df = (
+        df.unique(subset=["Date-Time"], keep="last", maintain_order=True)
+        .upsample(time_column="Date-Time", every="500ms", maintain_order=True)
+        .with_columns(pl.col(df.columns).fill_null(strategy='forward'))
+        # .select(pl.all().last())
+        # .group_by_dynamic('Date-Time', every='500us')
+        # .agg(pl.all().mean())
     )
     
-    first_row = df.head(1).with_columns(
-        (pl.col("Date-Time").dt.truncate("1s")).alias("Date-Time")
-    )
-    df = pl.concat([first_row, df])
-        
-    filename = os.path.join(final_data_folder, f"{ric}_{date.strftime('%y_%m_%d')}.csv")
+    ticker_df = trades_df.filter(
+            (pl.col("#RIC") == f"{ric.split('.')[0]}.xt") & (pl.col("Date") == date)
+        )
 
-    df = (df.unique(subset=["Date-Time"], keep="first", maintain_order=True)
-            .upsample(time_column="Date-Time", every="500ms", maintain_order=True)
-            .with_columns(pl.col(df.columns).fill_null(strategy='forward'))
-            # .select(pl.all().last())
-            # .group_by_dynamic('Date-Time', every='500us')
-            # .agg(pl.all().mean())
+    ticker_agg_df = ticker_df.group_by("Date-Time-Rounded", maintain_order=True).agg([
+        (pl.col("Price") * pl.col("Volume")).sum().alias("VWAP_Numerator"),
+        pl.col("Volume").sum().alias("Total_Volume")
+        ])
+
+    ticker_agg_df = ticker_agg_df.with_columns(
+                    (pl.col("VWAP_Numerator") / pl.col("Total_Volume")).alias("VWAP")
+                ).with_columns(pl.col("Total_Volume").alias("Volume")
+                ).drop(["VWAP_Numerator", "Total_Volume"]
+                ).rename({"Date-Time-Rounded": "Date-Time"})
+                
+                
+    df = (
+        df
+        .join(ticker_agg_df, on="Date-Time", how="left")
+        .with_columns(pl.col("Volume").fill_null(0))
+        .with_columns(pl.col("VWAP").fill_null(strategy="forward").round(3))
+        .with_columns(pl.col("VWAP").fill_null(strategy="backward").round(3))
+        )
+    df = df.drop(["#RIC", "Date"]).rename({"Date-Time": "date"}).drop_nulls()
+    return df
+
+def main(args):
+
+    logging.info(f"Starting {os.path.abspath(__file__)}")
+
+    logging.info(f"Going to lazy load {book_filename}")
+    book_df = pl.scan_csv(book_filename, infer_schema_length=100000, try_parse_dates=True)
+
+
+    logging.info(f"Going to eagerly load {trades_filename}")
+    trades_df = pl.read_csv(trades_filename, infer_schema_length=100000, try_parse_dates=True)
+    trades_df = (
+            trades_df
+            .filter(pl.col("#RIC")==f"{args.ric_ticker}.xt")
+            .filter(
+                (pl.col("Date-Time").dt.time() >= time(7, 0)) &
+                (pl.col("Date-Time").dt.time() <= time(15, 30)) &
+                (pl.col("Volume") != 0) &
+                (~pl.col("Qualifiers").is_in([i for i in trades_df["Qualifiers"].unique().to_list() if "Previous Day" in i]))
             )
-    df.drop(["#RIC", "Date"]).rename({"Date-Time": "date"}).write_csv(filename)
+            .with_columns(
+                pl.col("Date-Time").dt.date().alias("Date")
+            )
+            .with_columns(pl.col("Date-Time").xdt.ceil("500ms").alias("Date-Time-Rounded"))
+            .drop(trades_drop_columns)
+        )
 
+    book_df = (
+        book_df
+        .filter(pl.col("#RIC")==f"{args.ric_ticker}.MC")
+        .drop(["Domain", "GMT Offset", "Type", "Exch Time"])
+        .filter(
+            (pl.col("Date-Time").dt.time() >= time(7, 0)) &
+            (pl.col("Date-Time").dt.time() <= time(15, 30))
+        )
+        .filter(~pl.all_horizontal(pl.col(bid_columns_to_check_all_nans).is_null()))
+        .filter(~pl.all_horizontal(pl.col(ask_columns_to_check_all_nans).is_null()))
+        .with_columns(
+            [pl.col(col).fill_null(0) for col in fill_null_with_zero]
+        )  # Fill null size and number of orders with zero 
+        .with_columns(
+            [pl.col(col).fill_null(strategy='forward') for col in [*bid_price_columns, *ask_price_columns]]
+        )  # Fill 
+        .with_columns(
+            pl.col("Date-Time").dt.date().alias("Date")
+        )
+        .with_columns(pl.col("Date-Time").xdt.ceil("500ms").alias("Date-Time"))
+        .drop_nulls()
+        # .drop_nulls()
+        # .with_columns(
+        #     pl.len().over("Date-Time").alias('duplicate_datetime')
+        # )
+        # .with_columns(
+        #     pl.col("Date-Time").cum_count().over("Date-Time").alias('counter')
+        # )
+        # .with_columns(
+        #     (pl.col("Date-Time").dt.cast_time_unit('ns') + pl.duration(nanoseconds=(nanoseconds_in_a_microsecond/pl.col("duplicate_datetime"))*(pl.col("counter")-1))).alias("Date-Time")
+        # )
+        .select(ordered_columns)
+    ).collect()
+    final_df = pl.DataFrame()
+    for (ric, date) in book_df.select(["#RIC", "Date"]).unique().sort(by="Date", maintain_order=True).to_numpy():
+        df = write_book_one_day(book_df, trades_df, ric, date)
+        final_df = pl.concat([final_df, df], how="vertical")
+    final_df.write_csv(os.path.join(f"{args.final_data_folder}", f"{args.ric_ticker}_lob.csv"))
+    logging.info(f"Null count: {final_df.null_count().sum_horizontal().sum()}")
+    logging.info(f"Finished {os.path.abspath(__file__)}")
 
-# %%
-logging.info(f"Finished {os.path.abspath(__file__)}")
+if __name__ == "__main__": 
+    fix_seed = 42
+    random.seed(fix_seed)
+    torch.manual_seed(fix_seed)
+    np.random.seed(fix_seed)
+
+    # Logging configuration
+    outfile = "./log_experiment.log"
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(outfile),
+            logging.StreamHandler()
+        ]
+    )
+    parser = argparse.ArgumentParser(description='L1-L10 Limit Order Book data processing')
+    parser.add_argument('--final_data_folder', type=str, default='./dataset/lob', help='Path to output the data')
+    parser.add_argument('--ric_ticker', type=str, default='GRLS', help='Ticker to process')
+    args = parser.parse_args()
+    logging.info(f"Arguments for script: {args}")
+    main(args)
